@@ -30,16 +30,16 @@ def scan_directory(root_dir):
             for name in filenames:
                 if name.lower().endswith(".pdf"):
                     fullpath = os.path.join(dirpath, name)
-                    print(f"Checking: {fullpath}")
+                    # print(f"Checking: {fullpath}")
 
                     if pdf_needs_ocr(fullpath):
-                        print(f"  → Needs OCR")
+                        # print(f"  → Needs OCR")
                         results.append(fullpath)
                         non_ocr_file.write(fullpath + "\n")
                         non_ocr_file.flush()
                         non_ocr_count += 1
                     else:
-                        print(f"  → Already OCR'd")
+                        # print(f"  → Already OCR'd")
                         ocr_file.write(fullpath + "\n")
                         ocr_file.flush()
                         ocr_count += 1
