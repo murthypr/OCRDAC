@@ -45,6 +45,15 @@ def load_config(config_path):
 
     return config
 
+# Fix pdf_needs_ocr: use pikepdf instead of missing --is-text-visible flag
+# ocrmypdf --is-text-visible does not exist in v16.13.0. The command
+# was failing with exit code 2, and the code treated any non-6 return
+# as "has text layer", so every PDF was falsely classified as already
+# OCR'd.
+#
+# Replaced the CLI call with pikepdf (already installed as an ocrmypdf
+# dependency) to directly inspect page content streams for BT/ET text
+# operators. Also added generated files to .gitignore.
 def pdf_needs_ocr(path):
     """Returns True if PDF has NO text layer (needs OCR)."""
     import pikepdf
