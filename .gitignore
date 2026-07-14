@@ -221,3 +221,4 @@ __marimo__/
 ocr_files.txt
 non_ocr_files.txt
 original_pdf_files/
+tmp/

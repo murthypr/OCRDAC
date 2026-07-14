@@ -24,6 +24,9 @@ DEFAULT_CONFIG = {
     "progress_interval": "25",
     "overwrite": "false",
     "skip_existing_ocr": "true",
+    "preprocessing": "none",       # "none" or "median"
+    "median_filter_size": "3",
+    "threshold": "130",
 }
 
 def load_config(config_path):
@@ -77,13 +80,41 @@ def pdf_needs_ocr(path):
     pdf.close()
     return True
 
-def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing_ocr):
+def preprocess_page(page_image, filter_size, threshold):
+    """Apply median filter + threshold to remove scan artifacts like horizontal stripes."""
+    from PIL import Image, ImageFilter
+    gray = page_image.convert("L")
+    median = gray.filter(ImageFilter.MedianFilter(filter_size))
+    return median.point(lambda x: 255 if x > threshold else 0)
+
+def render_pages_to_images(pdf_path, dpi=300):
+    """Render each PDF page to a PIL Image using ghostscript."""
+    from PIL import Image
+    import tempfile
+    images = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        subprocess.run(
+            ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m", f"-r{dpi}",
+             f"-sOutputFile={tmpdir}/page_%03d.png", pdf_path],
+            capture_output=True, timeout=300
+        )
+        for f in sorted(os.listdir(tmpdir)):
+            if f.endswith(".png"):
+                images.append(Image.open(os.path.join(tmpdir, f)).copy())
+    return images
+
+def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing_ocr,
+            preprocessing="none", filter_size=3, threshold=130):
     """Run OCRmyPDF on a single PDF."""
     if skip_existing_ocr and not pdf_needs_ocr(input_path):
         return "skipped", "Already has text layer"
 
     if not overwrite and os.path.exists(output_path) and input_path != output_path:
         return "skipped", f"Output exists: {output_path}"
+
+    if preprocessing == "median":
+        return _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
+                                     filter_size, threshold)
 
     cmd = ["ocrmypdf"]
     if ocrmypdf_options:
@@ -97,6 +128,38 @@ def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, ski
         return "skipped", "Already has text layer"
     else:
         return "error", result.stderr.strip()
+
+def _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
+                          filter_size, threshold):
+    """OCR by preprocessing pages with median filter, then running tesseract + gs."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        images = render_pages_to_images(input_path)
+        if not images:
+            return "error", "Failed to render pages"
+
+        txt_files = []
+        for i, img in enumerate(images):
+            processed = preprocess_page(img, filter_size, threshold)
+            page_path = os.path.join(tmpdir, f"page_{i:03d}")
+            processed.save(f"{page_path}.png")
+            result = subprocess.run(
+                ["tesseract", f"{page_path}.png", page_path,
+                 "--psm", "6", "-l", languages, "pdf"],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return "error", f"tesseract failed on page {i+1}: {result.stderr.strip()}"
+            txt_files.append(f"{page_path}.pdf")
+
+        # Merge individual page PDFs
+        merge_cmd = ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
+                     f"-sOutputFile={output_path}"] + txt_files
+        result = subprocess.run(merge_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return "error", f"gs merge failed: {result.stderr.strip()}"
+
+        return "success", ""
 
 def scan_directory(root_dir, config):
     """Scan directory for PDFs and categorize them."""
@@ -151,6 +214,9 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     ocrmypdf_options = config["ocrmypdf_options"]
     overwrite = config["overwrite"].lower() == "true"
     skip_existing = config["skip_existing_ocr"].lower() == "true"
+    preprocessing = config["preprocessing"].lower()
+    filter_size = int(config["median_filter_size"])
+    threshold = int(config["threshold"])
 
     results = {"success": 0, "skipped": 0, "errors": []}
 
@@ -171,7 +237,8 @@ def convert_pdfs(non_ocr_files, config, script_dir):
             output_path = input_path
 
         print(f"[{i}/{len(non_ocr_files)}] {rel_path} ... ", end="", flush=True)
-        status, msg = ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing)
+        status, msg = ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing,
+                              preprocessing, filter_size, threshold)
 
         if status == "success":
             print("✓")
