@@ -10,7 +10,10 @@ import sys
 import time
 import configparser
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+
+from preprocessing_detector import detect_preprocessing_needed
 
 CONFIG_FILE = "ocrdac.config"
 DEFAULT_CONFIG = {
@@ -27,6 +30,8 @@ DEFAULT_CONFIG = {
     "preprocessing": "none",       # "none" or "median"
     "median_filter_size": "3",
     "threshold": "130",
+    "auto_preprocessing": "true",  # auto-detect per-page preprocessing needs
+    "ocrdac_version": "v0.2",
 }
 
 def load_config(config_path):
@@ -80,6 +85,43 @@ def pdf_needs_ocr(path):
     pdf.close()
     return True
 
+def _get_ocrmypdf_version():
+    """Return OCRmyPDF version string."""
+    try:
+        result = subprocess.run(["ocrmypdf", "--version"],
+                                capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() or result.stderr.strip()
+    except Exception:
+        return "unknown"
+
+def _get_ghostscript_version():
+    """Return Ghostscript version string."""
+    try:
+        result = subprocess.run(["gs", "--version"],
+                                capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+def write_metadata(output_pdf_path, metadata_dict):
+    """Write provenance metadata into a PDF using pikepdf."""
+    import pikepdf
+    with pikepdf.Pdf.open(output_pdf_path, allow_overwriting_input=True) as pdf:
+        for key, value in metadata_dict.items():
+            pdf.docinfo["/" + key] = value
+        pdf.save(output_pdf_path)
+
+def read_metadata(pdf_path):
+    """Read metadata dictionary from a PDF using pikepdf."""
+    import pikepdf
+    metadata = {}
+    with pikepdf.Pdf.open(pdf_path) as pdf:
+        if pdf.docinfo:
+            for key, value in pdf.docinfo.items():
+                clean_key = str(key).lstrip("/")
+                metadata[clean_key] = str(value)
+    return metadata
+
 def preprocess_page(page_image, filter_size, threshold):
     """Apply median filter + threshold to remove scan artifacts like horizontal stripes."""
     from PIL import Image, ImageFilter
@@ -103,8 +145,33 @@ def render_pages_to_images(pdf_path, dpi=300):
                 images.append(Image.open(os.path.join(tmpdir, f)).copy())
     return images
 
+def _attach_metadata(output_path, ocrdac_version, ocrmypdf_options, preprocessing,
+                     auto_preprocessing_enabled=False, auto_preprocessing_reason="none"):
+    """Collect provenance metadata and write it into the output PDF."""
+    ocrmypdf_ver = _get_ocrmypdf_version()
+    gs_ver = _get_ghostscript_version()
+    used_unpaper = "--unpaper" in (ocrmypdf_options or "")
+    dpi_norm = "default"
+
+    metadata = {
+        "OCRDAC-Version": ocrdac_version,
+        "OCRmyPDF-Version": ocrmypdf_ver,
+        "Ghostscript-Version": gs_ver,
+        "OCR-Flags": ocrmypdf_options or "",
+        "OCR-DateTime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Used-Unpaper": str(used_unpaper),
+        "DPI-Normalization": dpi_norm,
+        "Auto-Preprocessing-Enabled": str(auto_preprocessing_enabled),
+        "Auto-Preprocessing-Reason": auto_preprocessing_reason,
+    }
+
+    write_metadata(output_path, metadata)
+    print(f"Metadata written: OCRDAC-Version={ocrdac_version}, "
+          f"OCRmyPDF={ocrmypdf_ver}, GS={gs_ver}")
+
 def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing_ocr,
-            preprocessing="none", filter_size=3, threshold=130):
+            preprocessing="none", filter_size=3, threshold=130, ocrdac_version="v0.1",
+            auto_preprocessing=False):
     """Run OCRmyPDF on a single PDF."""
     if skip_existing_ocr and not pdf_needs_ocr(input_path):
         return "skipped", "Already has text layer"
@@ -114,7 +181,7 @@ def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, ski
 
     if preprocessing == "median":
         return _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
-                                     filter_size, threshold)
+                                     filter_size, threshold, ocrdac_version, auto_preprocessing)
 
     cmd = ["ocrmypdf"]
     if ocrmypdf_options:
@@ -123,6 +190,7 @@ def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, ski
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0:
+        _attach_metadata(output_path, ocrdac_version, ocrmypdf_options, preprocessing)
         return "success", ""
     elif result.returncode == 6:
         return "skipped", "Already has text layer"
@@ -130,8 +198,12 @@ def ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, ski
         return "error", result.stderr.strip()
 
 def _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
-                          filter_size, threshold):
-    """OCR by preprocessing pages with median filter, then running tesseract + gs."""
+                           filter_size, threshold, ocrdac_version, auto_preprocessing=False):
+    """OCR by preprocessing pages with median filter, then running tesseract + gs.
+
+    When auto_preprocessing is True, each page is analyzed and median filtering
+    is applied only to pages that need it. Clean pages are OCR'd directly.
+    """
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         images = render_pages_to_images(input_path)
@@ -139,10 +211,36 @@ def _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
             return "error", "Failed to render pages"
 
         txt_files = []
+        any_preprocessed = False
+        last_reason = "none"
+
         for i, img in enumerate(images):
-            processed = preprocess_page(img, filter_size, threshold)
-            page_path = os.path.join(tmpdir, f"page_{i:03d}")
-            processed.save(f"{page_path}.png")
+            page_needs_preprocessing = False
+            reason = "none"
+
+            if auto_preprocessing:
+                page_needs_preprocessing, reason = detect_preprocessing_needed(img)
+                if page_needs_preprocessing:
+                    any_preprocessed = True
+                    last_reason = reason
+                    print(f"  Auto-preprocessing: enabled (reason={reason})", flush=True)
+                else:
+                    print(f"  Auto-preprocessing: disabled (clean scan)", flush=True)
+            else:
+                page_needs_preprocessing = True
+                reason = "manual"
+                any_preprocessed = True
+                last_reason = "manual"
+
+            if page_needs_preprocessing:
+                processed = preprocess_page(img, filter_size, threshold)
+                page_path = os.path.join(tmpdir, f"page_{i:03d}")
+                processed.save(f"{page_path}.png")
+            else:
+                # Save the original page for tesseract
+                page_path = os.path.join(tmpdir, f"page_{i:03d}")
+                img.save(f"{page_path}.png")
+
             result = subprocess.run(
                 ["tesseract", f"{page_path}.png", page_path,
                  "--psm", "6", "-l", languages, "pdf"],
@@ -159,6 +257,9 @@ def _ocr_pdf_preprocessed(input_path, output_path, languages, ocrmypdf_options,
         if result.returncode != 0:
             return "error", f"gs merge failed: {result.stderr.strip()}"
 
+        _attach_metadata(output_path, ocrdac_version, ocrmypdf_options, "median",
+                         auto_preprocessing_enabled=auto_preprocessing,
+                         auto_preprocessing_reason=last_reason if auto_preprocessing else "none")
         return "success", ""
 
 def scan_directory(root_dir, config):
@@ -217,6 +318,8 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     preprocessing = config["preprocessing"].lower()
     filter_size = int(config["median_filter_size"])
     threshold = int(config["threshold"])
+    ocrdac_version = config["ocrdac_version"]
+    auto_preprocessing = config["auto_preprocessing"].lower() == "true"
 
     results = {"success": 0, "skipped": 0, "errors": []}
 
@@ -226,6 +329,13 @@ def convert_pdfs(non_ocr_files, config, script_dir):
         print(f"Output directory: {output_dir}")
     else:
         print("Mode: Overwrite in place")
+
+    if auto_preprocessing and preprocessing == "median":
+        print("Auto-preprocessing: ENABLED (per-page analysis)")
+    elif preprocessing == "median":
+        print("Auto-preprocessing: DISABLED (apply median to all pages)")
+    else:
+        print(f"Preprocessing: {preprocessing}")
 
     for i, input_path in enumerate(non_ocr_files, 1):
         rel_path = os.path.relpath(input_path, config["directory"])
@@ -238,7 +348,8 @@ def convert_pdfs(non_ocr_files, config, script_dir):
 
         print(f"[{i}/{len(non_ocr_files)}] {rel_path} ... ", end="", flush=True)
         status, msg = ocr_pdf(input_path, output_path, languages, ocrmypdf_options, overwrite, skip_existing,
-                              preprocessing, filter_size, threshold)
+                              preprocessing, filter_size, threshold, ocrdac_version,
+                              auto_preprocessing)
 
         if status == "success":
             print("✓")
@@ -262,6 +373,7 @@ def print_summary(results, convert_results, elapsed_seconds):
     print("OCRDAC SUMMARY")
     print("=" * 50)
     print(f"Time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    print(f"Total processing time: {elapsed_seconds}s")
     print(f"Files scanned: {results['processed']}")
     print(f"  Already OCR'd: {len(results['ocr'])}")
     print(f"  Need OCR:      {len(results['non_ocr'])}")
