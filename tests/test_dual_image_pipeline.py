@@ -136,7 +136,7 @@ class TestDualImagePipeline:
             preprocessing_setting="none",
             median_filter_size=3,
             threshold_val=130,
-            ocrdac_version="v0.1",
+            ocrdac_version="v0.3",
         )
         assert status == "success", f"Pipeline failed: {msg}"
 
@@ -151,7 +151,7 @@ class TestDualImagePipeline:
         assert "Auto-Preprocessing-Enabled" in meta
         assert "OCRmyPDF-Version" in meta
         assert "Ghostscript-Version" in meta
-        assert meta["OCRDAC-Version"] == "v0.1"
+        assert meta["OCRDAC-Version"] == "v0.3"
 
     def test_output_pdf_is_valid(self, simple_pdf, tmp_path):
         output = str(tmp_path / "output.pdf")

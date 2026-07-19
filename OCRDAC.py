@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "median_filter_size": "3",
     "threshold": "130",
     "auto_preprocessing": "true",
-    "ocrdac_version": "v0.1",
+    "ocrdac_version": "v0.3",
 }
 
 
@@ -173,7 +173,7 @@ def ocr_pdf_dual_image(
     input_path, output_path, languages,
     auto_preprocessing=True, preprocessing_setting="none",
     median_filter_size=3, threshold_val=130,
-    ocrdac_version="v0.1"
+    ocrdac_version="v0.3"
 ):
     """
     Dual‑image OCR pipeline for a single PDF.
@@ -479,10 +479,8 @@ if __name__ == "__main__":
     print(f"Scanning: {directory}")
     print("-" * 50)
 
-    start_time = time.perf_counter()
+    overall_start = time.monotonic()
     results = scan_directory(directory, config)
-    end_time = time.perf_counter()
-    elapsed_seconds = int(end_time - start_time)
 
     convert_results = None
     if mode == "prod" and results["non_ocr"]:
@@ -490,4 +488,5 @@ if __name__ == "__main__":
     elif mode == "prod":
         print("\nNo PDFs need OCR!")
 
-    print_summary(results, convert_results, elapsed_seconds)
+    overall_elapsed = int(time.monotonic() - overall_start)
+    print_summary(results, convert_results, overall_elapsed)

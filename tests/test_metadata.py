@@ -129,7 +129,7 @@ class TestOverwriteMetadata:
         _make_blank_pdf(pdf_path)
 
         meta1 = {
-            "OCRDAC-Version": "v0.1",
+            "OCRDAC-Version": "v0.3",
             "Auto-Preprocessing-Enabled": "True",
             "Auto-Preprocessing-Reason": "low_contrast",
             "Median-Filter-Used": "False",
@@ -220,7 +220,7 @@ class TestEdgeCases:
         _make_blank_pdf(pdf_path)
 
         meta = {
-            "OCRDAC-Version": "v0.1",
+            "OCRDAC-Version": "v0.3",
             "Auto-Preprocessing-Reason": "low_contrast",
             "OCR-DateTime": "2025-01-01T00:00:00Z",
             "OCRmyPDF-Version": "16.13",
