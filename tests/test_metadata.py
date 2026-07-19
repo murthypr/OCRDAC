@@ -1,8 +1,9 @@
-"""Tests for OCRDAC PDF metadata provenance."""
+"""Tests for OCRDAC PDF metadata provenance (v2 metadata fields)."""
 
 import os
 import sys
 from datetime import datetime, timezone
+import re
 
 import pikepdf
 import pytest
@@ -24,12 +25,14 @@ def _make_blank_pdf(path):
 def _sample_metadata():
     return {
         "OCRDAC-Version": OCRDAC_VERSION,
+        "Auto-Preprocessing-Enabled": "True",
+        "Auto-Preprocessing-Reason": "low_contrast",
+        "Median-Filter-Used": "True",
+        "Median-Filter-Size": "3",
+        "Threshold-Used": "130",
         "OCRmyPDF-Version": "16.13.0+dfsg1",
         "Ghostscript-Version": "10.06.0",
-        "OCR-Flags": "--deskew --clean",
         "OCR-DateTime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "Used-Unpaper": "False",
-        "DPI-Normalization": "default",
     }
 
 
@@ -53,7 +56,7 @@ class TestWriteMetadata:
         result = read_metadata(pdf_path)
 
         for key in meta:
-            assert result[key] == meta[key]
+            assert result[key] == meta[key], f"Mismatch for key {key}"
 
     def test_ocrdac_version_matches_config(self, tmp_path):
         pdf_path = str(tmp_path / "test.pdf")
@@ -87,11 +90,9 @@ class TestWriteMetadata:
         result = read_metadata(pdf_path)
 
         dt_str = result["OCR-DateTime"]
-        # ISO 8601: YYYY-MM-DDTHH:MM:SSZ
-        dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ")
-        assert dt is not None
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", dt_str)
 
-    def test_used_unpaper_is_boolean_string(self, tmp_path):
+    def test_median_filter_used_is_boolean_string(self, tmp_path):
         pdf_path = str(tmp_path / "test.pdf")
         _make_blank_pdf(pdf_path)
 
@@ -99,9 +100,9 @@ class TestWriteMetadata:
         write_metadata(pdf_path, meta)
         result = read_metadata(pdf_path)
 
-        assert result["Used-Unpaper"] in ("True", "False")
+        assert result["Median-Filter-Used"] in ("True", "False")
 
-    def test_dpi_normalization_matches(self, tmp_path):
+    def test_auto_preprocessing_enabled_is_boolean_string(self, tmp_path):
         pdf_path = str(tmp_path / "test.pdf")
         _make_blank_pdf(pdf_path)
 
@@ -109,7 +110,17 @@ class TestWriteMetadata:
         write_metadata(pdf_path, meta)
         result = read_metadata(pdf_path)
 
-        assert result["DPI-Normalization"] == "default"
+        assert result["Auto-Preprocessing-Enabled"] in ("True", "False")
+
+    def test_median_filter_size_is_numeric_string(self, tmp_path):
+        pdf_path = str(tmp_path / "test.pdf")
+        _make_blank_pdf(pdf_path)
+
+        meta = _sample_metadata()
+        write_metadata(pdf_path, meta)
+        result = read_metadata(pdf_path)
+
+        assert result["Median-Filter-Size"].isdigit()
 
 
 class TestOverwriteMetadata:
@@ -119,46 +130,46 @@ class TestOverwriteMetadata:
 
         meta1 = {
             "OCRDAC-Version": "v0.1",
+            "Auto-Preprocessing-Enabled": "True",
+            "Auto-Preprocessing-Reason": "low_contrast",
+            "Median-Filter-Used": "False",
+            "Median-Filter-Size": "3",
+            "Threshold-Used": "130",
             "OCRmyPDF-Version": "1.0",
             "Ghostscript-Version": "9.0",
-            "OCR-Flags": "--old-flag",
             "OCR-DateTime": "2024-01-01T00:00:00Z",
-            "Used-Unpaper": "False",
-            "DPI-Normalization": "default",
         }
         write_metadata(pdf_path, meta1)
 
         meta2 = {
             "OCRDAC-Version": "v0.2",
+            "Auto-Preprocessing-Enabled": "False",
+            "Auto-Preprocessing-Reason": "none",
+            "Median-Filter-Used": "False",
+            "Median-Filter-Size": "5",
+            "Threshold-Used": "100",
             "OCRmyPDF-Version": "2.0",
             "Ghostscript-Version": "10.0",
-            "OCR-Flags": "--new-flag",
             "OCR-DateTime": "2025-06-15T12:00:00Z",
-            "Used-Unpaper": "True",
-            "DPI-Normalization": "300",
         }
         write_metadata(pdf_path, meta2)
         result = read_metadata(pdf_path)
 
         for key in meta2:
-            assert result[key] == meta2[key]
+            assert result[key] == meta2[key], f"Mismatch for key {key}"
 
     def test_overwrite_preserves_extra_keys(self, tmp_path):
         pdf_path = str(tmp_path / "test.pdf")
         _make_blank_pdf(pdf_path)
 
-        # Write initial metadata including an extra key
         meta1 = _sample_metadata()
         meta1["Custom-Key"] = "custom_value"
         write_metadata(pdf_path, meta1)
 
-        # Overwrite with standard keys only
         meta2 = _sample_metadata()
         write_metadata(pdf_path, meta2)
         result = read_metadata(pdf_path)
 
-        # The extra key from pikepdf docinfo should persist since we
-        # only set specific keys (pikepdf doesn't remove unset keys)
         assert "OCRDAC-Version" in result
 
 
@@ -210,14 +221,16 @@ class TestEdgeCases:
 
         meta = {
             "OCRDAC-Version": "v0.1",
-            "OCR-Flags": "--deskew --clean \u2014 unicode",
+            "Auto-Preprocessing-Reason": "low_contrast",
             "OCR-DateTime": "2025-01-01T00:00:00Z",
-            "Used-Unpaper": "False",
-            "DPI-Normalization": "default",
             "OCRmyPDF-Version": "16.13",
             "Ghostscript-Version": "10.06",
+            "Median-Filter-Used": "True",
+            "Median-Filter-Size": "3",
+            "Threshold-Used": "130",
+            "Auto-Preprocessing-Enabled": "True",
         }
         write_metadata(pdf_path, meta)
         result = read_metadata(pdf_path)
 
-        assert result["OCR-Flags"] == "--deskew --clean \u2014 unicode"
+        assert result["Auto-Preprocessing-Reason"] == "low_contrast"
