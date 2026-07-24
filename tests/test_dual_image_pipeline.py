@@ -130,7 +130,7 @@ class TestDualImagePipeline:
 
     def test_pipeline_returns_success(self, simple_pdf, tmp_path):
         output = str(tmp_path / "output.pdf")
-        status, msg = ocr_pdf_dual_image(
+        status, msg, _ = ocr_pdf_dual_image(
             simple_pdf, output, "eng",
             auto_preprocessing=True,
             preprocessing_setting="none",
@@ -151,7 +151,7 @@ class TestDualImagePipeline:
         assert "Auto-Preprocessing-Enabled" in meta
         assert "OCRmyPDF-Version" in meta
         assert "Ghostscript-Version" in meta
-        assert meta["OCRDAC-Version"] == "v0.3"
+        assert meta["OCRDAC-Version"] == "v0.4"
 
     def test_output_pdf_is_valid(self, simple_pdf, tmp_path):
         output = str(tmp_path / "output.pdf")
@@ -175,7 +175,7 @@ class TestDualImagePipeline:
             pytest.skip("Sample PDF not found")
 
         output = str(tmp_path / "out1.pdf")
-        status, msg = ocr_pdf_dual_image(sample, output, "eng")
+        status, msg, _ = ocr_pdf_dual_image(sample, output, "eng")
         assert status == "success", f"First run failed: {msg}"
 
         # Verify output is valid
@@ -184,5 +184,5 @@ class TestDualImagePipeline:
 
         # Second run on output should succeed (and typically skip)
         output2 = str(tmp_path / "out2.pdf")
-        status2, msg2 = ocr_pdf_dual_image(output, output2, "eng")
+        status2, msg2, _ = ocr_pdf_dual_image(output, output2, "eng")
         assert status2 in ("success", "skipped"), f"Second run failed: {msg2}"

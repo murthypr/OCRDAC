@@ -185,7 +185,7 @@ class TestEndToEndWithRealSample:
 
     def test_sample_pdf_visually_crisp(self, tmp_path):
         output = str(tmp_path / "sample_out.pdf")
-        status, msg = ocr_pdf_dual_image(SAMPLE_PDF, output, "eng")
+        status, msg, _ = ocr_pdf_dual_image(SAMPLE_PDF, output, "eng")
         assert status == "success", f"Pipeline failed: {msg}"
 
         # Compare at native 300 DPI (no downscaling interpolation)
@@ -251,7 +251,7 @@ class TestEndToEndWithRealSample:
 
         monkeypatch.setattr(subprocess, 'run', capture_run)
         output = str(tmp_path / "no_conflict.pdf")
-        status, msg = ocr_pdf_dual_image(SAMPLE_PDF, output, "eng")
+        status, msg, _ = ocr_pdf_dual_image(SAMPLE_PDF, output, "eng")
         assert status == "success", f"Pipeline failed: {msg}"
 
 
@@ -266,7 +266,7 @@ class TestEndToEndSynthetic:
 
     def test_clean_pdf_visually_identical(self, clean_pdf, tmp_path):
         output = str(tmp_path / "clean_out.pdf")
-        status, msg = ocr_pdf_dual_image(
+        status, msg, _ = ocr_pdf_dual_image(
             clean_pdf, output, "eng",
             auto_preprocessing=True,
         )
@@ -285,7 +285,7 @@ class TestEndToEndSynthetic:
 
     def test_grey_pdf_visually_identical(self, grey_background_pdf, tmp_path):
         output = str(tmp_path / "grey_out.pdf")
-        status, msg = ocr_pdf_dual_image(
+        status, msg, _ = ocr_pdf_dual_image(
             grey_background_pdf, output, "eng",
             auto_preprocessing=True,
         )
@@ -304,7 +304,7 @@ class TestEndToEndSynthetic:
 
     def test_stripe_pdf_visually_identical(self, stripe_pdf, tmp_path):
         output = str(tmp_path / "stripe_out.pdf")
-        status, msg = ocr_pdf_dual_image(
+        status, msg, _ = ocr_pdf_dual_image(
             stripe_pdf, output, "eng",
             auto_preprocessing=True,
         )

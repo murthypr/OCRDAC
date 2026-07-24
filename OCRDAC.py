@@ -23,6 +23,7 @@ import subprocess
 import os
 import sys
 import time
+import shutil
 import configparser
 import io
 from datetime import datetime, timezone
@@ -48,7 +49,7 @@ DEFAULT_CONFIG = {
     "median_filter_size": "3",
     "threshold": "130",
     "auto_preprocessing": "true",
-    "ocrdac_version": "v0.3",
+    "ocrdac_version": "v0.4",
 }
 
 
@@ -173,15 +174,17 @@ def ocr_pdf_dual_image(
     input_path, output_path, languages,
     auto_preprocessing=True, preprocessing_setting="none",
     median_filter_size=3, threshold_val=130,
-    ocrdac_version="v0.3"
+    ocrdac_version="v0.4"
 ):
     """
     Dual‑image OCR pipeline for a single PDF.
 
     Returns (status, message) where status is "success", "skipped", or "error".
     """
+    EMPTY_STATS = {"clean_pages": 0, "preprocessed_pages": 0, "preprocessing_reasons": {}}
+
     if not pdf_needs_ocr(input_path):
-        return "skipped", "Already has text layer"
+        return "skipped", "Already has text layer", EMPTY_STATS
 
     import tempfile
     import io as _io
@@ -190,13 +193,16 @@ def ocr_pdf_dual_image(
         # ── 1. Render original pages to images ────────────────────────────────
         original_images = render_pages_to_images(input_path)
         if not original_images:
-            return "error", "Failed to render pages from PDF"
+            return "error", "Failed to render pages from PDF", EMPTY_STATS
 
         # ── 2. Create OCR copies and optionally preprocess ────────────────────
         ocr_images = []
         page_reasons = []
         any_preprocessed = False
         last_reason = "none"
+        clean_pages = 0
+        preprocessed_pages = 0
+        preprocessing_reasons = {}
 
         for i, img in enumerate(original_images):
             ocr_img = img.copy()
@@ -210,6 +216,11 @@ def ocr_pdf_dual_image(
                 reason = "manual"
 
             if should_preprocess:
+                preprocessed_pages += 1
+                display_reason = reason
+                if display_reason == "stripes":
+                    display_reason = "stripe_artifacts"
+                preprocessing_reasons[display_reason] = preprocessing_reasons.get(display_reason, 0) + 1
                 any_preprocessed = True
                 last_reason = reason
                 ocr_img = preprocess_ocr_image(ocr_img, median_filter_size, threshold_val)
@@ -218,6 +229,7 @@ def ocr_pdf_dual_image(
                 else:
                     print(f"  Page {i+1}: Preprocessing: applied (manual)", flush=True)
             else:
+                clean_pages += 1
                 ocr_img = ocr_img.convert("RGB")
                 if auto_preprocessing:
                     print(f"  Page {i+1}: Auto-preprocessing: disabled (clean scan)", flush=True)
@@ -259,7 +271,7 @@ def ocr_pdf_dual_image(
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode not in (0, 6):
-            return "error", f"OCRmyPDF failed (code {result.returncode}): {result.stderr.strip()}"
+            return "error", f"OCRmyPDF failed (code {result.returncode}): {result.stderr.strip()}", EMPTY_STATS
 
         # ── 5. Replace OCRmyPDF's image layer with original images ────────────
         with pikepdf.Pdf.open(ocr_pdf_path) as pdf:
@@ -306,7 +318,12 @@ def ocr_pdf_dual_image(
 
             pdf.save(output_path)
 
-        return "success", ""
+        stats = {
+            "clean_pages": clean_pages,
+            "preprocessed_pages": preprocessed_pages,
+            "preprocessing_reasons": preprocessing_reasons,
+        }
+        return "success", "", stats
 
 
 # ── Scanning ─────────────────────────────────────────────────────────────────
@@ -357,6 +374,30 @@ def scan_directory(root_dir, config):
     return results
 
 
+# ── Copy Already-OCR'd PDFs ─────────────────────────────────────────────────
+
+def copy_ocr_pdfs(ocr_files, config, script_dir):
+    """Copy already-OCR'd PDFs to the output directory."""
+    output_dir = config["output_dir"]
+    if not output_dir:
+        return 0
+
+    print(f"\n=== PROD MODE: Copying {len(ocr_files)} already-OCR'd PDFs ===")
+    if output_dir:
+        print(f"Output directory: {output_dir}")
+
+    copied = 0
+    for filepath in ocr_files:
+        rel_path = os.path.relpath(filepath, config["directory"])
+        dest = os.path.join(output_dir, rel_path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(filepath, dest)
+        copied += 1
+
+    print(f"  Copied {copied} file(s).")
+    return copied
+
+
 # ── Conversion Orchestration ─────────────────────────────────────────────────
 
 def convert_pdfs(non_ocr_files, config, script_dir):
@@ -372,6 +413,9 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     auto_preprocessing = config["auto_preprocessing"].lower() == "true"
 
     results = {"success": 0, "skipped": 0, "errors": []}
+    agg_clean = 0
+    agg_preprocessed = 0
+    agg_reasons = {}
 
     print(f"\n=== PROD MODE: Converting {len(non_ocr_files)} PDFs ===")
     if output_dir:
@@ -394,8 +438,8 @@ def convert_pdfs(non_ocr_files, config, script_dir):
         else:
             output_path = input_path
 
-        print(f"[{i}/{len(non_ocr_files)}] {rel_path} ... ", end="", flush=True)
-        status, msg = ocr_pdf_dual_image(
+        print(f"[{i}/{len(non_ocr_files)}] {rel_path} ... \n", end="", flush=True)
+        status, msg, stats = ocr_pdf_dual_image(
             input_path, output_path, languages,
             auto_preprocessing=auto_preprocessing,
             preprocessing_setting=preprocessing,
@@ -405,6 +449,10 @@ def convert_pdfs(non_ocr_files, config, script_dir):
         )
 
         if status == "success":
+            agg_clean += stats["clean_pages"]
+            agg_preprocessed += stats["preprocessed_pages"]
+            for reason, count in stats["preprocessing_reasons"].items():
+                agg_reasons[reason] = agg_reasons.get(reason, 0) + count
             print("\u2713")
             results["success"] += 1
         elif status == "skipped":
@@ -414,6 +462,11 @@ def convert_pdfs(non_ocr_files, config, script_dir):
             print(f"\u2717 {msg}")
             results["errors"].append((input_path, msg))
 
+    results["preprocessing_stats"] = {
+        "clean_pages": agg_clean,
+        "preprocessed_pages": agg_preprocessed,
+        "preprocessing_reasons": agg_reasons,
+    }
     return results
 
 
@@ -441,6 +494,17 @@ def print_summary(results, convert_results, elapsed_seconds):
             print("\nErrors:")
             for path, err in convert_results["errors"]:
                 print(f"  {path}: {err}")
+
+    if convert_results and convert_results.get("preprocessing_stats"):
+        stats = convert_results["preprocessing_stats"]
+        if stats["clean_pages"] > 0 or stats["preprocessed_pages"] > 0:
+            print(f"\nAuto-Preprocessing Summary:")
+            print(f"  Clean pages (no preprocessing needed): {stats['clean_pages']}")
+            print(f"  Preprocessed pages: {stats['preprocessed_pages']}")
+            if stats["preprocessing_reasons"]:
+                print(f"  Reasons:")
+                for reason, count in sorted(stats["preprocessing_reasons"].items()):
+                    print(f"    - {reason}: {count}")
 
     print(f"\nResults saved to:")
     print(f"  OCR'd files:     {DEFAULT_CONFIG['ocr_output_file']}")
@@ -483,10 +547,13 @@ if __name__ == "__main__":
     results = scan_directory(directory, config)
 
     convert_results = None
-    if mode == "prod" and results["non_ocr"]:
-        convert_results = convert_pdfs(results["non_ocr"], config, script_dir)
-    elif mode == "prod":
-        print("\nNo PDFs need OCR!")
+    if mode == "prod":
+        if results["ocr"]:
+            copy_ocr_pdfs(results["ocr"], config, script_dir)
+        if results["non_ocr"]:
+            convert_results = convert_pdfs(results["non_ocr"], config, script_dir)
+        elif not results["ocr"]:
+            print("\nNo PDFs need OCR!")
 
     overall_elapsed = int(time.monotonic() - overall_start)
     print_summary(results, convert_results, overall_elapsed)
