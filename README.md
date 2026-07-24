@@ -1,4 +1,4 @@
-# OCRDAC — OCR Document Analysis & Conversion
+# OCRDAC — OCR Detection And Conversion
 
 Scans directories for PDFs, detects which need OCR, and converts them using a
 **dual-image pipeline** that preserves the original visual layer pixel-for-pixel
