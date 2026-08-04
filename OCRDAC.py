@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "median_filter_size": "3",
     "threshold": "130",
     "auto_preprocessing": "true",
+    "copy_already_ocred_files": "true",
     "ocrdac_version": "v0.4",
 }
 
@@ -335,9 +336,11 @@ def scan_directory(root_dir, config):
     ocr_output_path = os.path.join(script_dir, config["ocr_output_file"])
     non_ocr_output_path = os.path.join(script_dir, config["non_ocr_output_file"])
     progress_interval = int(config["progress_interval"])
+    copy_already_ocred = config.get("copy_already_ocred_files", "true").lower() == "true"
 
     results = {
         "ocr": [],
+        "ocr_count": 0,
         "non_ocr": [],
         "processed": 0,
         "errors": []
@@ -361,8 +364,9 @@ def scan_directory(root_dir, config):
                         results["non_ocr"].append(fullpath)
                         non_ocr_file.write(fullpath + "\n")
                         non_ocr_file.flush()
-                    else:
+                    elif copy_already_ocred:
                         results["ocr"].append(fullpath)
+                        results["ocr_count"] += 1
                         ocr_file.write(fullpath + "\n")
                         ocr_file.flush()
 
@@ -377,7 +381,14 @@ def scan_directory(root_dir, config):
 # ── Copy Already-OCR'd PDFs ─────────────────────────────────────────────────
 
 def copy_ocr_pdfs(ocr_files, config, script_dir):
-    """Copy already-OCR'd PDFs to the output directory."""
+    """Copy already-OCR'd PDFs to the output directory.
+
+    Controlled by config key copy_already_ocred_files. When false, the
+    already-OCR'd PDFs are skipped entirely (no copying).
+    """
+    if config.get("copy_already_ocred_files", "true").lower() != "true":
+        return 0
+
     output_dir = config["output_dir"]
     if not output_dir:
         return 0
@@ -470,7 +481,7 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     return results
 
 
-def print_summary(results, convert_results, elapsed_seconds):
+def print_summary(results, convert_results, elapsed_seconds, ocr_copied=None):
     """Print summary of results."""
     hours = elapsed_seconds // 3600
     minutes = (elapsed_seconds % 3600) // 60
@@ -484,6 +495,9 @@ def print_summary(results, convert_results, elapsed_seconds):
     print(f"Files scanned: {results['processed']}")
     print(f"  Already OCR'd: {len(results['ocr'])}")
     print(f"  Need OCR:      {len(results['non_ocr'])}")
+
+    if ocr_copied:
+        print(f"  Copied (already OCR'd): {ocr_copied}")
 
     if convert_results:
         print(f"\nConversion results:")
@@ -547,13 +561,14 @@ if __name__ == "__main__":
     results = scan_directory(directory, config)
 
     convert_results = None
+    ocr_copied = 0
     if mode == "prod":
         if results["ocr"]:
-            copy_ocr_pdfs(results["ocr"], config, script_dir)
+            ocr_copied = copy_ocr_pdfs(results["ocr"], config, script_dir)
         if results["non_ocr"]:
             convert_results = convert_pdfs(results["non_ocr"], config, script_dir)
         elif not results["ocr"]:
             print("\nNo PDFs need OCR!")
 
     overall_elapsed = int(time.monotonic() - overall_start)
-    print_summary(results, convert_results, overall_elapsed)
+    print_summary(results, convert_results, overall_elapsed, ocr_copied=ocr_copied)
