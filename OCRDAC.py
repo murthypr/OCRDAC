@@ -25,6 +25,7 @@ import sys
 import time
 import shutil
 import configparser
+import shlex
 import io
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ DEFAULT_CONFIG = {
     "directory": "./pdfs",
     "output_dir": "",
     "ocr_languages": "eng",
+    "ocrmypdf_params": "",
     "ocr_output_file": "ocr_files.txt",
     "non_ocr_output_file": "non_ocr_files.txt",
     "progress_interval": "25",
@@ -175,7 +177,8 @@ def ocr_pdf_dual_image(
     input_path, output_path, languages,
     auto_preprocessing=True, preprocessing_setting="none",
     median_filter_size=3, threshold_val=130,
-    ocrdac_version="v0.4"
+    ocrdac_version="v0.4",
+    ocrmypdf_params=""
 ):
     """
     Dual‑image OCR pipeline for a single PDF.
@@ -266,11 +269,29 @@ def ocr_pdf_dual_image(
             "--force-ocr",
             "--image-dpi", "300",
             "-l", languages,
-            ocr_images_pdf,
-            ocr_pdf_path,
         ]
+        # Insert user-controlled OCRmyPDF flags (from ocrmypdf_params in
+        # ocrdac.config) BEFORE the input/output positional paths. OCRmyPDF
+        # rejects flags placed after the two positional arguments, and
+        # argparse would otherwise try to consume the input path as a flag
+        # value (e.g. --verbose <input.pdf>). User flags keep their order and
+        # OCRDAC's built-in flags are preserved.
+        if ocrmypdf_params:
+            cmd.extend(shlex.split(ocrmypdf_params))
+        cmd.extend([ocr_images_pdf, ocr_pdf_path])
+
+        verbose_mode = "--verbose" in cmd
+        if verbose_mode:
+            print("  OCRmyPDF command:", " ".join(cmd), flush=True)
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if verbose_mode:
+            if result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                if not result.stderr.endswith("\n"):
+                    sys.stderr.write("\n")
         if result.returncode not in (0, 6):
             return "error", f"OCRmyPDF failed (code {result.returncode}): {result.stderr.strip()}", EMPTY_STATS
 
@@ -457,6 +478,7 @@ def convert_pdfs(non_ocr_files, config, script_dir):
             median_filter_size=filter_size,
             threshold_val=threshold_val,
             ocrdac_version=ocrdac_version,
+            ocrmypdf_params=config.get("ocrmypdf_params", ""),
         )
 
         if status == "success":
