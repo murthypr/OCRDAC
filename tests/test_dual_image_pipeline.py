@@ -15,6 +15,7 @@ from OCRDAC import (
     render_pages_to_images,
     ocr_pdf_dual_image,
     read_metadata,
+    DEFAULT_CONFIG,
 )
 from preprocessing_detector import detect_preprocessing_needed
 
@@ -151,7 +152,7 @@ class TestDualImagePipeline:
         assert "Auto-Preprocessing-Enabled" in meta
         assert "OCRmyPDF-Version" in meta
         assert "Ghostscript-Version" in meta
-        assert meta["OCRDAC-Version"] == "v0.4"
+        assert meta["OCRDAC-Version"] == DEFAULT_CONFIG["ocrdac_version"]
 
     def test_output_pdf_is_valid(self, simple_pdf, tmp_path):
         output = str(tmp_path / "output.pdf")

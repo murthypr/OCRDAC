@@ -825,13 +825,38 @@ def print_summary(results, convert_results, elapsed_seconds, ocr_copied=None):
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    cli_args = sys.argv[1:]
+    config_arg = None
+    positional = []
+    i = 0
+    while i < len(cli_args):
+        if cli_args[i] == "--config":
+            if i + 1 >= len(cli_args) or not cli_args[i + 1]:
+                print("Error: --config requires a file path")
+                sys.exit(1)
+            config_arg = cli_args[i + 1]
+            i += 2
+        elif cli_args[i].startswith("--config="):
+            value = cli_args[i].split("=", 1)[1]
+            if not value:
+                print("Error: --config requires a file path")
+                sys.exit(1)
+            config_arg = value
+            i += 1
+        else:
+            positional.append(cli_args[i])
+            i += 1
+
     config_path = os.path.join(script_dir, CONFIG_FILE)
+    if config_arg is not None:
+        config_path = config_arg
     config = load_config(config_path)
 
-    if len(sys.argv) > 1:
-        config["directory"] = sys.argv[1]
-    if len(sys.argv) > 2:
-        config["mode"] = sys.argv[2]
+    if len(positional) > 0:
+        config["directory"] = positional[0]
+    if len(positional) > 1:
+        config["mode"] = positional[1]
 
     mode = config["mode"].lower()
     if mode not in ("dry-run", "prod"):

@@ -33,6 +33,7 @@ def _minimal_config(directory, tmp_path=None):
         "threshold": "130",
         "ocrdac_version": "v0.3",
         "auto_preprocessing": "false",
+        "preserve_original_pdf": "false",
         "progress_interval": "25",
         "ocr_output_file": "ocr_files.txt",
         "non_ocr_output_file": "non_ocr_files.txt",

@@ -443,6 +443,7 @@ class TestEndToEndMultipleFiles:
         )
 
         config = _config_for(str(src), tmp_path=tmp_path)
+        config["preserve_original_pdf"] = "false"
 
         results = scan_directory(str(src), config)
         convert_results = convert_pdfs(results["non_ocr"], config, str(src))
