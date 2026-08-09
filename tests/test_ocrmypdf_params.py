@@ -237,6 +237,7 @@ class TestConvertThreadsParams:
             "ocr_output_file": str(tmp_path / "ocr_files.txt"),
             "non_ocr_output_file": str(tmp_path / "non_ocr_files.txt"),
             "ocrmypdf_params": "--verbose --optimize 3",
+            "preserve_original_pdf": "false",
         }
         convert_pdfs([in_pdf], config, str(tmp_path))
         cmd = ocr_cmd_recorder[0]

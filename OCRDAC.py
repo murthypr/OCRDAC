@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-OCRDAC - OCR Document Analysis & Conversion (v2 Dual-Image Pipeline)
+OCRDAC - OCR Document Analysis & Conversion
 
-Scans directories for PDFs, detects which need OCR, and converts them
-using a dual-image pipeline that preserves the original visual layer
-pixel-for-pixel while applying preprocessing (median filter + threshold)
-ONLY to the OCR input image.
+Two OCR pipelines:
 
-Pipeline per page:
-  1. Extract original page image (image_original) — never modified.
-  2. Create OCR-only copy (image_for_ocr).
-  3. If auto_preprocessing detects low contrast / stripes / uneven
-     background, apply median filter + threshold to image_for_ocr.
-  4. Feed ONLY image_for_ocr to OCRmyPDF with flags:
-       --force-ocr --skip-text --image-dpi 300
-  5. Replace the image layer in the OCRmyPDF output with the original
-     image_original, preserving crisp visuals + full OCR text.
-  6. Write provenance metadata.
+1. Preserve-original (default, preserve_original_pdf=true):
+   - The original PDF is opened directly with pikepdf and NEVER rasterized.
+   - Pages are rasterized (or their embedded images extracted) ONLY to feed
+     Tesseract; those images are never embedded in the output.
+   - OCR text is grafted onto each original page as a positioned text layer
+     (built from HOCR bounding boxes) using pikepdf alone.
+   - Ghostscript is never used for the final PDF generation.
+
+2. Legacy dual-image pipeline (preserve_original_pdf=false):
+   - Renders pages via Ghostscript, runs OCRmyPDF on preprocessed images,
+     then swaps the original visuals back in. Can degrade quality.
 """
 
 import subprocess
@@ -27,6 +25,8 @@ import shutil
 import configparser
 import shlex
 import io
+import re
+import html as _html
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,7 +52,9 @@ DEFAULT_CONFIG = {
     "threshold": "130",
     "auto_preprocessing": "true",
     "copy_already_ocred_files": "true",
-    "ocrdac_version": "v0.4",
+    "preserve_original_pdf": "true",
+    "invisible_text_layer": "true",
+    "ocrdac_version": "v0.5",
 }
 
 
@@ -76,6 +78,21 @@ def load_config(config_path):
                 config[key] = parser["OCRDAC"][key].strip().strip('"\'')
 
     return config
+
+
+def parse_bool(value, default=False):
+    """Parse a boolean config value (case-insensitive).
+
+    Accepts "true"/"false" (also 1/0, yes/no, on/off). Returns default
+    when the value is missing or unparsable.
+    """
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+    return default
 
 
 # ── PDF Inspection ───────────────────────────────────────────────────────────
@@ -163,6 +180,285 @@ def render_pages_to_images(pdf_path, dpi=300):
     return images
 
 
+# ── Clean Sandwich Pipeline (preserve_original_pdf) ──────────────────────────
+
+def extract_ocr_images(pdf_path, dpi=300):
+    """Return per-page PIL images used ONLY as Tesseract input.
+
+    Strategy (original PDF is never modified):
+      1. PyMuPDF: use a page's embedded image when it is the sole, roughly
+         page-sized raster (native, lossless extraction).
+      2. Otherwise rasterize the page with PyMuPDF at `dpi` dpi.
+      3. Fall back to Ghostscript rendering (render_pages_to_images) when
+         PyMuPDF is not installed.
+    """
+    try:
+        import pymupdf
+    except ImportError:
+        return render_pages_to_images(pdf_path, dpi=dpi)
+
+    images = []
+    doc = pymupdf.open(pdf_path)
+    for page in doc:
+        page_rect = page.rect
+        used_native = False
+        raw = page.get_images(full=True)
+        if raw:
+            try:
+                base = doc.extract_image(raw[0][0])
+                data = base["image"]
+                pil_img = Image.open(io.BytesIO(data)).convert("RGB")
+                aspect_page = page_rect.width / page_rect.height
+                aspect_img = pil_img.width / pil_img.height
+                if abs(aspect_page - aspect_img) / aspect_page < 0.05:
+                    images.append(pil_img)
+                    used_native = True
+            except Exception:
+                pass
+        if not used_native:
+            pix = page.get_pixmap(dpi=dpi)
+            images.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+    doc.close()
+    return images
+
+
+def prepare_ocr_images(images, auto_preprocessing, preprocessing_setting,
+                       median_filter_size, threshold_val):
+    """Shared preprocessing stage: returns (ocr_images, stats, last_reason).
+
+    Takes the page images destined for OCR input and applies
+    auto/manual preprocessing decisions, exactly as the dual-image
+    pipeline did, so both pipelines OCR the same images.
+    """
+    ocr_images = []
+    any_preprocessed = False
+    last_reason = "none"
+    clean_pages = 0
+    preprocessed_pages = 0
+    preprocessing_reasons = {}
+
+    for i, img in enumerate(images):
+        ocr_img = img.copy()
+        should_preprocess = False
+        reason = "none"
+
+        if auto_preprocessing:
+            should_preprocess, reason = detect_preprocessing_needed(img)
+        elif preprocessing_setting == "median":
+            should_preprocess = True
+            reason = "manual"
+
+        if should_preprocess:
+            preprocessed_pages += 1
+            display_reason = reason
+            if display_reason == "stripes":
+                display_reason = "stripe_artifacts"
+            preprocessing_reasons[display_reason] = preprocessing_reasons.get(display_reason, 0) + 1
+            any_preprocessed = True
+            last_reason = reason
+            ocr_img = preprocess_ocr_image(ocr_img, median_filter_size, threshold_val)
+            if auto_preprocessing:
+                print(f"  Page {i+1}: Auto-preprocessing: enabled (reason={reason})", flush=True)
+            else:
+                print(f"  Page {i+1}: Preprocessing: applied (manual)", flush=True)
+        else:
+            clean_pages += 1
+            ocr_img = ocr_img.convert("RGB")
+            if auto_preprocessing:
+                print(f"  Page {i+1}: Auto-preprocessing: disabled (clean scan)", flush=True)
+            else:
+                print(f"  Page {i+1}: Preprocessing: not applied", flush=True)
+
+        ocr_images.append(ocr_img)
+
+    stats = {
+        "clean_pages": clean_pages,
+        "preprocessed_pages": preprocessed_pages,
+        "preprocessing_reasons": preprocessing_reasons,
+    }
+    return ocr_images, stats, last_reason, any_preprocessed
+
+
+def run_tesseract_hocr(image, tmpdir, index, languages):
+    """Run Tesseract on one OCR-only image; returns the HOCR HTML text.
+
+    The image is saved to a temp file purely for Tesseract input; it is
+    never embedded in a PDF.
+    """
+    img_path = os.path.join(tmpdir, f"ocr_input_{index}.png")
+    image.save(img_path)
+    cmd = ["tesseract", img_path, "stdout", "-l", languages, "--psm", "3", "hocr"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"tesseract failed (code {result.returncode}): {result.stderr.strip()}")
+    return result.stdout
+
+
+_HOCR_BBOX_RE = re.compile(
+    r"title\s*=\s*[\"']\s*bbox\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)")
+
+
+def parse_hocr_words(hocr_text):
+    """Parse (x0, y0, x1, y1, word) tuples from Tesseract HOCR output.
+
+    Coordinates are in image pixels, origin top-left (HOCR convention).
+    HTML entities in the word text are unescaped. Attribute quoting
+    (single or double) is handled for both tesseract 4.x and 5.x, and
+    word spans nested inside line spans are found by scanning tag text
+    rather than assuming a flat structure.
+    """
+    words = []
+    pos = 0
+    while True:
+        i = hocr_text.find("ocrx_word", pos)
+        if i == -1:
+            break
+        start = hocr_text.rfind("<", 0, i)
+        tag_end = hocr_text.find(">", i)
+        attrs = hocr_text[start:tag_end]
+        bm = _HOCR_BBOX_RE.search(attrs)
+        if bm:
+            x0, y0, x1, y1 = (float(v) for v in bm.groups())
+            close = hocr_text.find("</span>", tag_end)
+            body = hocr_text[tag_end + 1:close]
+            text = _html.unescape(body).strip()
+            if text:
+                words.append((x0, y0, x1, y1, text))
+        pos = tag_end
+    return words
+
+
+def _pdf_escape(text):
+    """Encode unicode OCR text into a PDF string literal body."""
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def graft_hocr_text(pdf, page_adaptive, hocr_text, image_size,
+                    invisible_text_layer=True):
+    """Graft a positioned OCR text layer onto one PDF page.
+
+    HOCR word boxes (pixels, top-left origin) are mapped into PDF user
+    space via the page's MediaBox, so text overlays the original visuals
+    without altering any existing content or image XObjects.
+
+    When invisible_text_layer is true the text is rendered with PDF
+    rendering mode 3 (invisible): the glyphs are not painted, but the
+    text remains fully selectable, copyable, searchable, and indexable.
+    Font size/color, opacity, blending mode, and text positioning are
+    unchanged; only the rendering mode operator is added.
+    """
+    words = parse_hocr_words(hocr_text)
+    if not words:
+        return 0
+
+    img_w, img_h = image_size
+    media = page_adaptive.MediaBox  # e.g. [0, 0, w, h] in points
+    page_wx = float(media[2])
+    page_hy = float(media[3])
+    sx = page_wx / img_w
+    sy = page_hy / img_h
+
+    ops = ["BT"]
+    if invisible_text_layer:
+        ops.append("3 Tr")  # rendering mode 3: invisible text
+    for x0, y0, x1, y1, text in words:
+        x = x0 * sx
+        y = page_hy - (y1 * sy)  # flip to PDF bottom-left origin
+        size = max(1.0, (y1 - y0) * sy)
+        safe = _pdf_escape(text)
+        ops.append(f"1 0 0 1 {x:.3f} {y:.3f} Tm /F1 {size:.3f} Tf ({safe}) Tj")
+    ops.append("ET")
+    body = "\n".join(ops).encode("latin-1")
+
+    # Ensure the page carries an /F1 Helvetica font resource.
+    res = page_adaptive.Resources
+    if res is None:
+        res = pikepdf.Dictionary()
+        page_adaptive.Resources = res
+    fonts = res.get(pikepdf.Name.Font)
+    if fonts is None:
+        fonts = pikepdf.Dictionary()
+        res[pikepdf.Name.Font] = fonts
+    if pikepdf.Name.F1 not in fonts:
+        fonts[pikepdf.Name.F1] = pikepdf.Name.Helvetica
+
+    new_stream = pikepdf.Stream(pdf, body)
+    contents = page_adaptive.get(pikepdf.Name.Contents)
+    if contents is None:
+        page_adaptive[pikepdf.Name.Contents] = new_stream
+    elif isinstance(contents, pikepdf.Array):
+        contents.append(new_stream)
+    else:
+        page_adaptive[pikepdf.Name.Contents] = pikepdf.Array([contents, new_stream])
+    return len(words)
+
+
+def ocr_pdf_preserve(input_path, output_path, languages,
+                     auto_preprocessing=True, preprocessing_setting="none",
+                     median_filter_size=3, threshold_val=130,
+                     ocrdac_version="v0.5", invisible_text_layer=True):
+    """
+    Clean-sandwich pipeline: OCR a PDF WITHOUT rasterizing or altering the
+    original page content (no Ghostscript at the final stage).
+
+    Returns (status, message) where status is "success", "skipped", or "error".
+    """
+    EMPTY_STATS = {"clean_pages": 0, "preprocessed_pages": 0, "preprocessing_reasons": {}}
+
+    if not pdf_needs_ocr(input_path):
+        return "skipped", "Already has text layer", EMPTY_STATS
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ── 1. OCR INPUT ONLY: rasterize/extract pages for Tesseract ─────────
+        ocr_input_images = extract_ocr_images(input_path)
+        if not ocr_input_images:
+            return "error", "Failed to extract page images for OCR", EMPTY_STATS
+
+        # ── 2. Preprocess OCR input (never embedded in the output) ────────────
+        ocr_images, stats, last_reason, any_preprocessed = prepare_ocr_images(
+            ocr_input_images, auto_preprocessing, preprocessing_setting,
+            median_filter_size, threshold_val)
+
+        # ── 3. Open original untouched; run Tesseract; graft text ─────────────
+        overwrite_input = (os.path.abspath(input_path) == os.path.abspath(output_path))
+        with pikepdf.Pdf.open(input_path, allow_overwriting_input=overwrite_input) as pdf:
+            page_count = len(pdf.pages)
+            if len(ocr_images) < page_count:
+                return "error", f"OCR input pages ({len(ocr_images)}) < PDF pages ({page_count})", EMPTY_STATS
+
+            for i, page in enumerate(pdf.pages):
+                hocr = run_tesseract_hocr(ocr_images[i], tmpdir, i, languages)
+                img_size = ocr_images[i].size
+                graft_hocr_text(pdf, page, hocr, img_size,
+                                invisible_text_layer=invisible_text_layer)
+                if invisible_text_layer:
+                    print(f"  Page {i+1}: OCR text layer: invisible (rendering_mode=3)",
+                          flush=True)
+                else:
+                    print(f"  Page {i+1}: OCR text layer: visible (rendering_mode=0)",
+                          flush=True)
+
+            # ── 4. Provenance metadata ─────────────────────────────────────────
+            meta_reason = last_reason if any_preprocessed else "none"
+            pdf.docinfo["/OCRDAC-Version"] = ocrdac_version
+            pdf.docinfo["/Auto-Preprocessing-Enabled"] = str(auto_preprocessing)
+            pdf.docinfo["/Auto-Preprocessing-Reason"] = meta_reason
+            pdf.docinfo["/Median-Filter-Used"] = str(any_preprocessed)
+            pdf.docinfo["/Median-Filter-Size"] = str(median_filter_size)
+            pdf.docinfo["/Threshold-Used"] = str(threshold_val)
+            pdf.docinfo["/OCRmyPDF-Version"] = _get_ocrmypdf_version()
+            pdf.docinfo["/Ghostscript-Version"] = _get_ghostscript_version()
+            pdf.docinfo["/OCR-DateTime"] = (
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+
+            pdf.save(output_path)
+
+        return "success", "", stats
+
+
 # ── Dual‑Image OCR Pipeline ──────────────────────────────────────────────────
 
 def preprocess_ocr_image(image, filter_size, threshold_val):
@@ -177,7 +473,7 @@ def ocr_pdf_dual_image(
     input_path, output_path, languages,
     auto_preprocessing=True, preprocessing_setting="none",
     median_filter_size=3, threshold_val=130,
-    ocrdac_version="v0.4",
+    ocrdac_version="v0.5",
     ocrmypdf_params=""
 ):
     """
@@ -200,48 +496,9 @@ def ocr_pdf_dual_image(
             return "error", "Failed to render pages from PDF", EMPTY_STATS
 
         # ── 2. Create OCR copies and optionally preprocess ────────────────────
-        ocr_images = []
-        page_reasons = []
-        any_preprocessed = False
-        last_reason = "none"
-        clean_pages = 0
-        preprocessed_pages = 0
-        preprocessing_reasons = {}
-
-        for i, img in enumerate(original_images):
-            ocr_img = img.copy()
-            should_preprocess = False
-            reason = "none"
-
-            if auto_preprocessing:
-                should_preprocess, reason = detect_preprocessing_needed(img)
-            elif preprocessing_setting == "median":
-                should_preprocess = True
-                reason = "manual"
-
-            if should_preprocess:
-                preprocessed_pages += 1
-                display_reason = reason
-                if display_reason == "stripes":
-                    display_reason = "stripe_artifacts"
-                preprocessing_reasons[display_reason] = preprocessing_reasons.get(display_reason, 0) + 1
-                any_preprocessed = True
-                last_reason = reason
-                ocr_img = preprocess_ocr_image(ocr_img, median_filter_size, threshold_val)
-                if auto_preprocessing:
-                    print(f"  Page {i+1}: Auto-preprocessing: enabled (reason={reason})", flush=True)
-                else:
-                    print(f"  Page {i+1}: Preprocessing: applied (manual)", flush=True)
-            else:
-                clean_pages += 1
-                ocr_img = ocr_img.convert("RGB")
-                if auto_preprocessing:
-                    print(f"  Page {i+1}: Auto-preprocessing: disabled (clean scan)", flush=True)
-                else:
-                    print(f"  Page {i+1}: Preprocessing: not applied", flush=True)
-
-            ocr_images.append(ocr_img)
-            page_reasons.append(reason)
+        ocr_images, stats_internal, last_reason, any_preprocessed = prepare_ocr_images(
+            original_images, auto_preprocessing, preprocessing_setting,
+            median_filter_size, threshold_val)
 
         # ── 3. Save OCR-only images as a single PDF ──────────────────────────
         #     OCRmyPDF accepts one input (PDF or single image), so we combine
@@ -340,12 +597,7 @@ def ocr_pdf_dual_image(
 
             pdf.save(output_path)
 
-        stats = {
-            "clean_pages": clean_pages,
-            "preprocessed_pages": preprocessed_pages,
-            "preprocessing_reasons": preprocessing_reasons,
-        }
-        return "success", "", stats
+        return "success", "", stats_internal
 
 
 # ── Scanning ─────────────────────────────────────────────────────────────────
@@ -433,7 +685,11 @@ def copy_ocr_pdfs(ocr_files, config, script_dir):
 # ── Conversion Orchestration ─────────────────────────────────────────────────
 
 def convert_pdfs(non_ocr_files, config, script_dir):
-    """Convert non-OCR PDFs using the dual-image pipeline (prod mode)."""
+    """Convert non-OCR PDFs (prod mode).
+
+    Uses the clean-sandwich pipeline when preserve_original_pdf=true
+    (default) and the legacy Ghostscript dual-image pipeline otherwise.
+    """
     output_dir = config["output_dir"]
     languages = config["ocr_languages"]
     overwrite = config["overwrite"].lower() == "true"
@@ -443,6 +699,10 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     threshold_val = int(config["threshold"])
     ocrdac_version = config["ocrdac_version"]
     auto_preprocessing = config["auto_preprocessing"].lower() == "true"
+    preserve_original = parse_bool(
+        config.get("preserve_original_pdf", ""), default=True)
+    invisible_text_layer = parse_bool(
+        config.get("invisible_text_layer", ""), default=True)
 
     results = {"success": 0, "skipped": 0, "errors": []}
     agg_clean = 0
@@ -456,10 +716,17 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     else:
         print("Mode: Overwrite in place")
 
-    if auto_preprocessing:
+    if preserve_original:
+        print("Clean-sandwich pipeline: ENABLED (original PDF preserved, "
+              "OCR text grafted via pikepdf, no Ghostscript)")
+    elif auto_preprocessing:
         print("Dual-image pipeline: ENABLED (original visuals preserved, auto-preprocessing for OCR)")
     else:
         print(f"Dual-image pipeline: ENABLED (original visuals preserved, preprocessing={preprocessing})")
+    if invisible_text_layer:
+        print("OCR text layer: invisible (rendering_mode=3)")
+    else:
+        print("OCR text layer: visible (rendering_mode=0)")
 
     for i, input_path in enumerate(non_ocr_files, 1):
         rel_path = os.path.relpath(input_path, config["directory"])
@@ -471,15 +738,26 @@ def convert_pdfs(non_ocr_files, config, script_dir):
             output_path = input_path
 
         print(f"[{i}/{len(non_ocr_files)}] {rel_path} ... \n", end="", flush=True)
-        status, msg, stats = ocr_pdf_dual_image(
-            input_path, output_path, languages,
-            auto_preprocessing=auto_preprocessing,
-            preprocessing_setting=preprocessing,
-            median_filter_size=filter_size,
-            threshold_val=threshold_val,
-            ocrdac_version=ocrdac_version,
-            ocrmypdf_params=config.get("ocrmypdf_params", ""),
-        )
+        if preserve_original:
+            status, msg, stats = ocr_pdf_preserve(
+                input_path, output_path, languages,
+                auto_preprocessing=auto_preprocessing,
+                preprocessing_setting=preprocessing,
+                median_filter_size=filter_size,
+                threshold_val=threshold_val,
+                ocrdac_version=ocrdac_version,
+                invisible_text_layer=invisible_text_layer,
+            )
+        else:
+            status, msg, stats = ocr_pdf_dual_image(
+                input_path, output_path, languages,
+                auto_preprocessing=auto_preprocessing,
+                preprocessing_setting=preprocessing,
+                median_filter_size=filter_size,
+                threshold_val=threshold_val,
+                ocrdac_version=ocrdac_version,
+                ocrmypdf_params=config.get("ocrmypdf_params", ""),
+            )
 
         if status == "success":
             agg_clean += stats["clean_pages"]
