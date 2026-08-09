@@ -45,8 +45,6 @@ DEFAULT_CONFIG = {
     "ocr_output_file": "ocr_files.txt",
     "non_ocr_output_file": "non_ocr_files.txt",
     "progress_interval": "25",
-    "overwrite": "false",
-    "skip_existing_ocr": "true",
     "preprocessing": "none",
     "median_filter_size": "3",
     "threshold": "130",
@@ -692,8 +690,6 @@ def convert_pdfs(non_ocr_files, config, script_dir):
     """
     output_dir = config["output_dir"]
     languages = config["ocr_languages"]
-    overwrite = config["overwrite"].lower() == "true"
-    skip_existing = config["skip_existing_ocr"].lower() == "true"
     preprocessing = config["preprocessing"].lower()
     filter_size = int(config["median_filter_size"])
     threshold_val = int(config["threshold"])
