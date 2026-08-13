@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Record script start time
+start_time=$SECONDS
+
 # Exit immediately if NAPS2 console utility is not found
 if ! command -v naps2 &> /dev/null; then
     echo "Error: 'naps2' command not found. Please make sure NAPS2 is installed and in your PATH." >&2
@@ -54,7 +57,7 @@ for file in *.pdf *.jpg *.jpeg *.JPG *.JPEG *.png *.PNG; do
     echo "Processing: $file -> $output_pdf"
     
     # Execute NAPS2 OCR conversion (works natively for images and PDFs)
-    if naps2 console -i "$file" -n 0 -o "$output_pdf" --enableocr; then
+    if naps2 console -i "$file" -n 0 -o "$output_pdf" --enableocr --deskew; then
         echo "  [OK] Successfully processed: $output_pdf"
         ((processed_count++))
         
@@ -71,6 +74,12 @@ for file in *.pdf *.jpg *.jpeg *.JPG *.JPEG *.png *.PNG; do
     echo "----------------------------------------"
 done
 
+# Calculate total execution time
+elapsed_seconds=$(( SECONDS - start_time ))
+minutes=$(( elapsed_seconds / 60 ))
+seconds=$(( elapsed_seconds % 60 ))
+
 echo "Batch processing finished."
 echo "Summary: $processed_count file(s) OCRed, $skipped_count file(s) skipped."
+printf "Total Execution Time: %dm %ds (%d seconds total)\n" "$minutes" "$seconds" "$elapsed_seconds"
 
